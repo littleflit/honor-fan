@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# honor-fan - read and control the fans on HONOR MagicBook Pro 16 (DRA-XX)
+set -euo pipefail
+
+find_hwmon() {
+    for h in /sys/class/hwmon/hwmon*; do
+        [ "$(cat "$h/name" 2>/dev/null)" = "honor_fan" ] && { echo "$h"; return 0; }
+    done
+    echo "honor_fan hwmon not found - is the module loaded? (sudo modprobe honor_fan)" >&2
+    return 1
+}
+
+H=$(find_hwmon)
+
+usage() {
+    cat <<USAGE
+usage: honor-fan <command>
+
+  status              show fan RPM, temperatures and control mode
+  auto                hand the fans back to EC firmware control
+  set <0-100>         manual mode at the given percent
+  raw <addr> [val]    read/write an extended-EC byte (advanced)
+
+examples:
+  honor-fan status
+  honor-fan set 70
+  honor-fan auto
+USAGE
+}
+
+case "${1:-status}" in
+status)
+    printf "mode      : %s\n" \
+        "$([ "$(cat "$H"/pwm1_enable)" = 1 ] && echo manual || echo "auto (EC firmware)")"
+    printf "pwm1      : %s/255\n" "$(cat "$H"/pwm1)"
+    for f in "$H"/fan*_input; do
+        printf "%-10s: %s rpm\n" "$(basename "$f" _input)" "$(cat "$f")"
+    done
+    echo
+    for t in "$H"/temp*_input; do
+        n=$(basename "$t" _input)
+        lbl=$(cat "$H/${n}_label" 2>/dev/null || echo "$n")
+        printf "%-10s: %s C\n" "$lbl" "$(( $(cat "$t") / 1000 ))"
+    done
+    ;;
+auto)
+    echo 2 | sudo tee "$H"/pwm1_enable >/dev/null
+    echo "fans returned to EC firmware control"
+    ;;
+set)
+    pct=${2:?need a percent 0-100}
+    [ "$pct" -ge 0 ] && [ "$pct" -le 100 ] || { echo "percent must be 0-100" >&2; exit 1; }
+    echo 1 | sudo tee "$H"/pwm1_enable >/dev/null
+    echo $(( pct * 255 / 100 )) | sudo tee "$H"/pwm1 >/dev/null
+    echo "manual mode at ${pct}%"
+    ;;
+raw)
+    addr=${2:?need an address, e.g. 0x20020A00}
+    echo "$addr" | sudo tee "$H/device/ec_addr" >/dev/null
+    if [ $# -ge 3 ]; then
+        echo "$3" | sudo tee "$H/device/ec_data" >/dev/null
+        echo "wrote $3 to $addr"
+    else
+        printf "%s = %s\n" "$addr" "$(sudo cat "$H/device/ec_data")"
+    fi
+    ;;
+*)
+    usage; exit 1 ;;
+esac

@@ -1,0 +1,17 @@
+[Unit]
+Description=HONOR MagicBook fan curve
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/fan_curve.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+
+# Install with:
+#   sudo cp fan_curve.py /usr/local/bin/
+#   sudo cp honor-fan-curve.service /etc/systemd/system/
+#   sudo systemctl enable --now honor-fan-curve
