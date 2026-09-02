@@ -75,6 +75,16 @@ module_param(enable_control, bool, 0444);
 MODULE_PARM_DESC(enable_control,
 	"Allow writing fan speed (default 0 = monitoring only). The EC loses sync under sustained write traffic and can leave the fans stopped until left idle ~40s; see README.");
 
+static int write_delay_ms = 150;
+module_param(write_delay_ms, int, 0644);
+MODULE_PARM_DESC(write_delay_ms,
+	"Delay after each EC write, ms (default 150). Lower values desync the EC.");
+
+static int release_delay_ms = 1000;
+module_param(release_delay_ms, int, 0644);
+MODULE_PARM_DESC(release_delay_ms,
+	"Settle time after releasing to firmware before re-arming manual mode, ms (default 1000).");
+
 static int fsud_manual = 1;
 module_param(fsud_manual, int, 0644);
 MODULE_PARM_DESC(fsud_manual, "FSUD token that selects manual mode (default 1)");
@@ -86,6 +96,8 @@ struct honor_fan {
 	struct mutex lock;	/* serialises mailbox transactions */
 	u8 pwm;
 	bool manual;
+	u8 last_fsud, last_fsvl;	/* what the EC was last told */
+	bool programmed;
 };
 
 static struct platform_device *honor_fan_pdev;
@@ -181,9 +193,11 @@ out:
 	acpi_release_global_lock(glk);
 	/*
 	 * The EC loses sync if writes arrive back-to-back: it starts
-	 * ignoring FSUD/FSVL and leaves the fans stopped.  Pace them.
+	 * ignoring FSUD/FSVL and leaves the fans stopped.  Writes issued
+	 * from a shell ~150 ms apart never failed, 10 ms apart did, so pace
+	 * generously -- fan changes are not latency-sensitive.
 	 */
-	usleep_range(10000, 15000);
+	msleep(write_delay_ms);
 	return ret;
 }
 
@@ -203,7 +217,8 @@ static int fan_rpm(struct honor_fan *hf, int idx, long *val)
 	return 0;
 }
 
-/* One FSUD/FSVL programming pass.  Both registers must always be written:
+/*
+ * One FSUD/FSVL programming pass.  Both registers are always written:
  * a stale FSVL leaves the EC latched with the fans stopped.
  */
 static int program_fan(struct honor_fan *hf, u8 fsud, u8 fsvl)
@@ -212,39 +227,64 @@ static int program_fan(struct honor_fan *hf, u8 fsud, u8 fsvl)
 
 	if (ret)
 		return ret;
-	return ec_ext_write(hf, EXT_FSVL, fsvl);
+	ret = ec_ext_write(hf, EXT_FSVL, fsvl);
+	if (ret)
+		return ret;
+
+	hf->last_fsud = fsud;
+	hf->last_fsvl = fsvl;
+	hf->programmed = true;
+	return 0;
 }
 
 static int apply_pwm(struct honor_fan *hf)
 {
-	u8 fsvl = 0, target = 0;
-	int ret, tries;
+	u8 fsud = 0, fsvl = 0, target;
+	int ret;
 
 	/*
 	 * FSVL is an increment above the fan's idle base, in units of
 	 * 100 rpm: target_rpm = (base + FSVL) * 100, base 16 for fan1 and
 	 * 14 for fan2.  pwm 0 therefore means idle (~1600 rpm), never off.
 	 */
-	if (hf->manual)
+	if (hf->manual) {
+		fsud = fsud_manual;
 		fsvl = DIV_ROUND_CLOSEST((int)hf->pwm * fsvl_max, 255);
-
-	for (tries = 0; tries < 3; tries++) {
-		ret = program_fan(hf, 0, 0);		/* release to firmware */
-		if (!ret && hf->manual)
-			ret = program_fan(hf, fsud_manual, fsvl);
-		if (ret)
-			return ret;
-
-		/* Confirm the EC accepted it; target 0 means it went deaf. */
-		if (ec_ext_read(hf, EXT_FAN0_GEAR, &target))
-			return 0;
-		if (target)
-			return 0;
-
-		pr_warn("EC ignored fan programming, retrying\n");
-		usleep_range(50000, 60000);
 	}
 
+	/*
+	 * Every EC transaction is a chance to desync it, so do nothing at
+	 * all when the setting has not actually changed.  Userspace writing
+	 * pwm1 and pwm1_enable back to back would otherwise reprogram twice.
+	 */
+	if (hf->programmed && hf->last_fsud == fsud && hf->last_fsvl == fsvl)
+		return 0;
+
+	/*
+	 * The EC will not accept a new FSVL while FSUD is already 1: the
+	 * write is swallowed and the fans stop.  Every change must go
+	 * through a release, and the release needs time to settle -- the
+	 * inter-write pacing alone is not enough.
+	 */
+	ret = program_fan(hf, 0, 0);
+	if (ret)
+		return ret;
+
+	if (fsud) {
+		msleep(release_delay_ms);
+		ret = program_fan(hf, fsud, fsvl);
+		if (ret)
+			return ret;
+	}
+
+	/* Confirm the EC took it; a zero target means it stopped listening. */
+	if (ec_ext_read(hf, EXT_FAN0_GEAR, &target) || target)
+		return 0;
+
+	pr_warn("EC ignored fan programming; releasing to firmware\n");
+	msleep(200);
+	hf->manual = false;
+	program_fan(hf, 0, 0);
 	return 0;
 }
 

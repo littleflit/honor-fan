@@ -163,8 +163,14 @@ works reliably.
 Recovery is to **stop all mailbox traffic for ~40 seconds**; the EC then resumes normally.
 No register write has been found that shortcuts this.
 
-`honor_fan` mitigates with a 10 ms pace after each write plus a target read-back and
-retry, which reduces but does not eliminate the problem. **This is the main open issue.**
+Worse: the EC accepts the *first* manual setting and then stops listening. Writing a new
+`FSVL` while `FSUD` is already 1 is swallowed and both fans stop. Routing every change
+through a release (`FSUD=0, FSVL=0`) with a 1 s settle before re-arming — which is exactly
+the sequence that mapped the encoding reliably from a shell — does **not** fix it inside
+the driver.
+
+`honor_fan` paces writes 150 ms apart, skips no-op reprogramming, and verifies the target
+read-back, which helps but does not solve it. **This is the main open issue.**
 
 Untested hypotheses:
 

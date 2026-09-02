@@ -50,8 +50,11 @@ auto)
 set)
     pct=${2:?need a percent 0-100}
     [ "$pct" -ge 0 ] && [ "$pct" -le 100 ] || { echo "percent must be 0-100" >&2; exit 1; }
-    echo 1 | sudo tee "$H"/pwm1_enable >/dev/null
+    # Set the speed BEFORE switching to manual: while still in auto the pwm1
+    # write is a no-op for the EC, so only pwm1_enable actually programs it.
+    # Two programming passes back to back are enough to desync the EC.
     echo $(( pct * 255 / 100 )) | sudo tee "$H"/pwm1 >/dev/null
+    echo 1 | sudo tee "$H"/pwm1_enable >/dev/null
     echo "manual mode at ${pct}%"
     ;;
 raw)

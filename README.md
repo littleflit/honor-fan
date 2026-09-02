@@ -104,14 +104,23 @@ Physical ceiling is roughly 5800 rpm, so useful `FSVL` runs 0–42. `FSVL = 0` m
 |---|---|
 | Read both fan tachometers | **Works reliably** |
 | Read 11 EC temperature probes | **Works reliably** — cross-checked against kernel thermal zones |
-| Set fan speed | **Works, not yet reliable.** Mapping solved and verified (e.g. 100% → 4920/4500 rpm), but the EC intermittently desyncs and stops the fans until left idle. |
-| Return control to firmware | Same caveat as above |
+| Set fan speed **once**, from a clean state | **Works.** e.g. `set 70` → holds 4440/4260 rpm indefinitely, matching the predicted 4500. |
+| **Changing** speed while manual mode is active | **Broken.** The second setting is swallowed and both fans stop. |
+| Recovering from that | **Unreliable.** Idling the mailbox usually helps but 90 s has failed; sometimes only a reboot clears it. |
 
-Because of this, **`pwm1` is read-only by default**. Pass `enable_control=1` to unlock it.
+Because of this, **`pwm1` is read-only by default**. Pass `enable_control=1` to unlock it,
+and expect to need a reboot if you change speed more than once.
 
-Help wanted: the desync is the main open problem. Suspects are missing inter-transaction
-delay, a required EC query-event notification that `SFCS` triggers indirectly, or a
-handshake step not visible in the ASL.
+**Help wanted.** The EC accepts one manual setting and then stops listening. Attempts that
+did *not* fix it: pacing writes 150 ms apart (matching shell timing that never failed),
+releasing to firmware and re-arming with a 1 s settle, skipping redundant writes, and a
+four-step `FSUD` recovery poke. Remaining suspects:
+
+- an EC query event (`_Qxx`) that the firmware's own `SFCS` path triggers and we bypass
+- `ZNCJ` (plain EC `0x79`, default `0xA0`) needing a reset as part of the sequence — the
+  firmware's `_QF8` handler does exactly `ECWT (0xA0, RefOf (ZNCJ))`, and that register is
+  outside the extended space this driver can write
+- a handshake performed in SMM rather than AML, hence invisible in the tables
 
 ## Install
 
