@@ -160,8 +160,9 @@ naturally does — the EC stops acknowledging: `0x0A04` reads back 0 and the fan
 same sequence issued from a shell, where each `sudo tee` inserts hundreds of milliseconds,
 works reliably.
 
-Recovery is to **stop all mailbox traffic for ~40 seconds**; the EC then resumes normally.
-No register write has been found that shortcuts this.
+Recovery is to **stop all mailbox traffic and wait several minutes**; the EC then resumes
+normally on its own. 40-90 s is often not enough, which is easy to misread as a permanent
+latch. No register write has been found that shortcuts this, and no reboot is needed.
 
 Worse: the EC accepts the *first* manual setting and then stops listening. Writing a new
 `FSVL` while `FSUD` is already 1 is swallowed and both fans stop. Routing every change

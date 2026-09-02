@@ -106,10 +106,11 @@ Physical ceiling is roughly 5800 rpm, so useful `FSVL` runs 0–42. `FSVL = 0` m
 | Read 11 EC temperature probes | **Works reliably** — cross-checked against kernel thermal zones |
 | Set fan speed **once**, from a clean state | **Works.** e.g. `set 70` → holds 4440/4260 rpm indefinitely, matching the predicted 4500. |
 | **Changing** speed while manual mode is active | **Broken.** The second setting is swallowed and both fans stop. |
-| Recovering from that | **Unreliable.** Idling the mailbox usually helps but 90 s has failed; sometimes only a reboot clears it. |
+| Recovering from that | **Automatic, but slow.** The EC resumes on its own once mailbox traffic stops — observed to take several minutes, not the ~40 s first assumed. No reboot needed. |
 
 Because of this, **`pwm1` is read-only by default**. Pass `enable_control=1` to unlock it,
-and expect to need a reboot if you change speed more than once.
+and expect the fans to stop, and stay stopped for some minutes, if you change speed more
+than once.
 
 **Help wanted.** The EC accepts one manual setting and then stops listening. Attempts that
 did *not* fix it: pacing writes 150 ms apart (matching shell timing that never failed),
@@ -191,10 +192,14 @@ returns the fans to firmware control on exit, as does the driver on unload.
 
 ### If the fans stop
 
-Unload the module and wait ~40 seconds — the EC recovers by itself:
+Stop touching the EC and wait. It recovers on its own, but give it **several minutes** —
+90 seconds has not been enough. A reboot is not required.
 
 ```bash
-sudo rmmod honor_fan; sleep 40; sudo insmod honor_fan.ko
+sudo rmmod honor_fan
+sleep 300
+sudo insmod honor_fan.ko
+tools/honor-fan status
 ```
 
 The CPU keeps its own hardware thermal protection (throttle and shutdown at 110 °C)
