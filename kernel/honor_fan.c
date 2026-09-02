@@ -471,10 +471,16 @@ static void honor_fan_remove(struct platform_device *pdev)
 {
 	struct honor_fan *hf = platform_get_drvdata(pdev);
 
-	/* never leave the fan stuck under manual control */
+	/*
+	 * Only touch the EC if we actually took manual control.  Every write
+	 * is a mailbox transaction, and issuing them needlessly on unload is
+	 * itself enough to desync the EC and stop the fans.
+	 */
 	mutex_lock(&hf->lock);
-	hf->manual = false;
-	apply_pwm(hf);
+	if (hf->manual) {
+		hf->manual = false;
+		apply_pwm(hf);
+	}
 	mutex_unlock(&hf->lock);
 }
 
