@@ -89,14 +89,20 @@ Measured, exactly linear:
 Physical ceiling is roughly 5800 rpm, so useful `FSVL` runs 0–42. `FSVL = 0` means idle
 (~1600 rpm), **not** off.
 
-### Two things that will bite you
+### Three things that will bite you
 
-1. **Both registers must always be written.** Setting `FSUD=0` alone to hand control back
-   leaves a stale `FSVL` behind, and the EC latches with **both fans stopped**, ignoring
-   further writes. `FSVL` must be zeroed too.
+1. **Never release-then-rearm across a mode transition.** Overwriting `FSUD`/`FSVL`
+   while manual is accepted without complaint, but a back-to-back `(0,0)` release
+   followed by a quick re-arm wedges the EC with **both fans stopped**. Returning to
+   firmware control must be staged: write `FSVL=0` alone, settle several seconds,
+   then write `FSUD=0` alone and settle again.
 2. **The EC desyncs under back-to-back writes.** Each write is a full unlock+write mailbox
    handshake; issued microseconds apart, the EC stops responding and can leave the fans
-   stopped. It recovers on its own after roughly **40 seconds of no mailbox traffic**.
+   stopped. Pace everything generously — fan changes are not latency-sensitive.
+3. **A wedged EC needs true idle, sometimes a power cycle.** Stop all mailbox traffic
+   (reads count too) and wait several minutes. If 15+ minutes of idle does not bring it
+   back, shut down, unplug AC, hold the power button 15 s, wait a minute and boot: the
+   EC is a separate microcontroller and only a G3 power cycle resets it for sure.
 
 ## Status
 
@@ -104,24 +110,20 @@ Physical ceiling is roughly 5800 rpm, so useful `FSVL` runs 0–42. `FSVL = 0` m
 |---|---|
 | Read both fan tachometers | **Works reliably** |
 | Read 11 EC temperature probes | **Works reliably** — cross-checked against kernel thermal zones |
-| Set fan speed **once**, from a clean state | **Works.** e.g. `set 70` → holds 4440/4260 rpm indefinitely, matching the predicted 4500. |
-| **Changing** speed while manual mode is active | **Broken.** The second setting is swallowed and both fans stop. |
-| Recovering from that | **Automatic, but slow.** The EC resumes on its own once mailbox traffic stops — observed to take several minutes, not the ~40 s first assumed. No reboot needed. |
+| Set fan speed **once**, from a clean state | **Works.** e.g. `set 70` → holds 4440/4260 rpm, matching the predicted 4500. |
+| **Changing** speed while manual mode is active | **Works.** e.g. `set 70` → `set 50` → `set 30` gives 4440 → 3660 → 2820 rpm. Updates overwrite `FSUD`/`FSVL` directly with no release step. |
+| Returning to firmware control (`auto`) | **Works**, via a staged release (`FSVL=0`, settle, `FSUD=0`, settle). Takes ~16 s. |
+| Recovering a wedged EC | Stop all mailbox traffic and wait several minutes; if that fails, a G3 power cycle (shutdown, unplug, hold power 15 s) resets it. No OS reboot needed. |
 
-Because of this, **`pwm1` is read-only by default**. Pass `enable_control=1` to unlock it,
-and expect the fans to stop, and stay stopped for some minutes, if you change speed more
-than once.
-
-**Help wanted.** The EC accepts one manual setting and then stops listening. Attempts that
-did *not* fix it: pacing writes 150 ms apart (matching shell timing that never failed),
-releasing to firmware and re-arming with a 1 s settle, skipping redundant writes, and a
-four-step `FSUD` recovery poke. Remaining suspects:
-
-- an EC query event (`_Qxx`) that the firmware's own `SFCS` path triggers and we bypass
-- `ZNCJ` (plain EC `0x79`, default `0xA0`) needing a reset as part of the sequence — the
-  firmware's `_QF8` handler does exactly `ECWT (0xA0, RefOf (ZNCJ))`, and that register is
-  outside the extended space this driver can write
-- a handshake performed in SMM rather than AML, hence invisible in the tables
+**How it was fixed.** The EC never refused second writes as such — it refused the
+*release-then-rearm* transition the driver put around every change. Direct overwrites
+(including redundantly rewriting `FSUD=1`) were verified to track repeatedly, and a
+spaced single-byte release was verified to hand control back cleanly. Ruled out along
+the way: `ECMT` races and `QWordAcc` tearing (repro reproduced identically through the
+firmware's own `\SFCS` method with its locks and timing), a missing `_Qxx` handshake
+(`\SFCS` has no firmware callers at all), and `ZNCJ` involvement (`0xA0` throughout;
+the EC never fired `_QF8`). Writes now go through the firmware's own `\SFCS`/`WTER`
+methods (`fw_path=1`, raw mailbox pokes remain available via `fw_path=0`).
 
 ## Install
 
@@ -192,14 +194,23 @@ returns the fans to firmware control on exit, as does the driver on unload.
 
 ### If the fans stop
 
-Stop touching the EC and wait. It recovers on its own, but give it **several minutes** —
-90 seconds has not been enough. A reboot is not required.
+Stop touching the EC and wait. It usually recovers on its own, but give it **several
+minutes** — 90 seconds has not been enough.
 
 ```bash
 sudo rmmod honor_fan
 sleep 300
 sudo insmod honor_fan.ko
 tools/honor-fan status
+```
+
+If 15+ minutes of idle does not help, reset the EC with a G3 power cycle (a plain
+reboot does not reset the EC — it stays on standby power):
+
+```bash
+sudo rmmod honor_fan
+sudo shutdown -h now
+# unplug AC, hold the power button 15 s, wait a minute, boot
 ```
 
 The CPU keeps its own hardware thermal protection (throttle and shutdown at 110 °C)
@@ -212,6 +223,9 @@ regardless of what this driver does.
 | `enable_control` | `0` | Allow writing fan speed. Off = monitoring only. |
 | `fsvl_max` | `42` | `FSVL` at `pwm1 = 255`; 42 ≈ 5800 rpm target. |
 | `fsud_manual` | `1` | Token written to `FSUD` to select manual mode. |
+| `fw_path` | `1` | Program via the firmware `\SFCS`/`WTER` methods; `0` falls back to raw mailbox pokes. |
+| `write_delay_ms` | `150` | Delay after each EC write. Lower values desync the EC. |
+| `release_step_ms` | `8000` | Settle between the steps of a staged manual→auto release. |
 | `force` | `0` | Skip the DMI model check (other models, at your own risk). |
 
 ## Reproducing the research

@@ -137,21 +137,22 @@ So `FSVL` is an increment above idle, in units of 100 rpm. `FSVL = 0` gives idle
 (~1600 rpm), never off. The fans top out near 5800 rpm, so `FSVL` above ~42 requests a
 speed the hardware cannot reach.
 
-## 6. Two behaviours you must handle
+## 6. Three behaviours you must handle
 
-### 6.1 Both registers must always be written
+### 6.1 Releasing needs both registers — spaced apart
 
 Setting `FSUD = 0` alone to return control to the firmware is **not enough**. The stale
 `FSVL` value leaves the EC latched with both fans stopped, and it then ignores further
-writes. The correct release sequence is:
+writes. Both must be zeroed — but **not back to back**: a `(0,0)` pair issued across the
+manual→auto transition wedges the EC exactly the same way. The working release is
+staged, with seconds of settle between steps:
 
 ```
-WTER(0x20020A1B, 0)
-WTER(0x20020A1C, 0)
+WTER(0x20020A1C, 0)     # step down to idle-manual first
+... settle ...
+WTER(0x20020A1B, 0)     # then hand ownership back
+... settle ...
 ```
-
-This was found the hard way: a `FSUD=0`-only release stopped the fans and no combination
-of `FSUD` values recovered them until `FSVL` was also zeroed.
 
 ### 6.2 The EC desyncs under back-to-back writes
 
@@ -160,26 +161,28 @@ naturally does — the EC stops acknowledging: `0x0A04` reads back 0 and the fan
 same sequence issued from a shell, where each `sudo tee` inserts hundreds of milliseconds,
 works reliably.
 
-Recovery is to **stop all mailbox traffic and wait several minutes**; the EC then resumes
-normally on its own. 40-90 s is often not enough, which is easy to misread as a permanent
-latch. No register write has been found that shortcuts this, and no reboot is needed.
+Recovery is to **stop all mailbox traffic (reads count too) and wait several minutes**;
+the EC then usually resumes on its own. 40-90 s is often not enough, which is easy to
+misread as a permanent latch, and in deep wedges idle alone does not recover it at all.
+The deterministic reset is a G3 power cycle: shut down, unplug AC, hold the power button
+15 s, wait a minute, boot. A plain reboot does not reset the EC — it stays on standby
+power. No register write has been found that shortcuts any of this.
 
-Worse: the EC accepts the *first* manual setting and then stops listening. Writing a new
-`FSVL` while `FSUD` is already 1 is swallowed and both fans stop. Routing every change
-through a release (`FSUD=0, FSVL=0`) with a 1 s settle before re-arming — which is exactly
-the sequence that mapped the encoding reliably from a shell — does **not** fix it inside
-the driver.
+### 6.3 Overwrites are fine — the release-rearm cycle was the bug
 
-`honor_fan` paces writes 150 ms apart, skips no-op reprogramming, and verifies the target
-read-back, which helps but does not solve it. **This is the main open issue.**
+The EC never refused second writes as such. Directly overwriting `FSUD`/`FSVL` while
+manual — including redundantly rewriting `FSUD=1` — tracks repeatedly (`set 70` →
+`set 50` → `set 30` giving 4440 → 3660 → 2820 rpm). What wedged it was the driver wrapping
+*every* change in a release (`FSUD=0, FSVL=0`) plus a quick re-arm. Routing every change
+through that cycle, even with a 1 s settle, fails; dropping the cycle fixes it.
 
-Untested hypotheses:
-
-- a longer or different inter-transaction delay
-- an EC query event (`_Qxx`) that `SFCS` triggers indirectly and we bypass
-- `ZNCJ` (plain EC `0x79`, default `0xA0`) may need resetting as part of the sequence —
-  the firmware's `_QF8` handler does exactly `ECWT (0xA0, RefOf (ZNCJ))`
-- a handshake step performed by SMM rather than AML, hence invisible in the tables
+Ruled out along the way: `ECMT`/locking races (the failure reproduced identically through
+the firmware's own `\SFCS` method, with its locks and `Sleep(2ms)` pacing — writes now go
+through `\SFCS`/`WTER` anyway, `fw_path=1`), a bypassed `_Qxx` handshake (`\SFCS` has no
+firmware callers at all: it is an OS-facing interface), and `ZNCJ` involvement (plain EC
+`0x79` reads `0xA0` throughout; the EC never fired `_QF8`). `honor_fan` programs manual
+targets with one `\SFCS` call, releases with spaced single `WTER`s, never re-arms without
+a full release, and does no readback confirm after programming.
 
 ## 7. Why userspace cannot do this
 

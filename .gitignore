@@ -13,3 +13,6 @@ modules.order
 # raw ACPI dumps (large, machine-specific; regenerate with iasl -d)
 acpi/
 snapshots/
+
+__pycache__/
+*.pyc

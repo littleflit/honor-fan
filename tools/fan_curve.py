@@ -66,8 +66,13 @@ class Fan:
         return max(temps)
 
     def set_percent(self, pct):
-        self._write("pwm1_enable", 1)
+        # pwm BEFORE enable: while still in auto the pwm write only stores
+        # the value, so a single programming pass happens on enable.
+        # The reverse order costs two release+program cycles per change
+        # and helps desync the EC (same reason tools/honor-fan `set`
+        # writes pwm first).
         self._write("pwm1", pct * 255 // 100)
+        self._write("pwm1_enable", 1)
 
     def auto(self):
         self._write("pwm1_enable", 2)

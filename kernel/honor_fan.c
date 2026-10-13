@@ -80,14 +80,19 @@ module_param(write_delay_ms, int, 0644);
 MODULE_PARM_DESC(write_delay_ms,
 	"Delay after each EC write, ms (default 150). Lower values desync the EC.");
 
-static int release_delay_ms = 1000;
-module_param(release_delay_ms, int, 0644);
-MODULE_PARM_DESC(release_delay_ms,
-	"Settle time after releasing to firmware before re-arming manual mode, ms (default 1000).");
-
 static int fsud_manual = 1;
 module_param(fsud_manual, int, 0644);
 MODULE_PARM_DESC(fsud_manual, "FSUD token that selects manual mode (default 1)");
+
+static bool fw_path = true;
+module_param(fw_path, bool, 0644);
+MODULE_PARM_DESC(fw_path,
+	"Program fans via the firmware \\SFCS method instead of raw mailbox pokes (default 1)");
+
+static int release_step_ms = 8000;
+module_param(release_step_ms, int, 0644);
+MODULE_PARM_DESC(release_step_ms,
+	"Settle time between the steps of a staged manual->auto release, ms (default 8000)");
 
 struct honor_fan {
 	struct device *hwmon;
@@ -201,6 +206,99 @@ out:
 	return ret;
 }
 
+/* --- firmware method path: \SFCS / \IFCI / \GSFV ------------------------ */
+/*
+ * DSDT layout, dissected on DRA-XX with `iasl -d` (all root-level, none
+ * called by the firmware itself -- they are OS-facing interfaces):
+ *
+ *   \SFCS(buf): byte[2]=FSUD, word[3]=FSVL -> WTER(0x20020A1B) + WTER(0x20020A1C)
+ *   \IFCI(buf): byte[2]=SFAN -> ECWT to ZNCJ (plain EC RAM offset 0x79)
+ *   \GSFV(buf): returns RFAN=ZNCJ as BUFF byte 1
+ *   _QF8 (EC query, fired by the EC itself): ECWT(0xA0, ZNCJ) + Notify(IETM)
+ *               -- the EC unilaterally hands fan ownership back to firmware.
+ *
+ * Evaluating \SFCS reuses the firmware's own ECMT mutex and Sleep(2ms)
+ * pacing, which raw mailbox pokes bypass.  All three return a 256-byte
+ * BUFF with STAT at byte 0 (0 = ok).
+ */
+static int fw_call(const char *path, u8 b2, u8 wlo, u8 *rfan)
+{
+	union acpi_object arg;
+	struct acpi_object_list args;
+	struct acpi_buffer output = { ACPI_ALLOCATE_BUFFER, NULL };
+	union acpi_object *obj;
+	acpi_status status;
+	u8 in[5] = { 0, 0, b2, wlo, 0 };
+	int ret = 0;
+
+	arg.type = ACPI_TYPE_BUFFER;
+	arg.buffer.length = sizeof(in);
+	arg.buffer.pointer = in;
+	args.count = 1;
+	args.pointer = &arg;
+
+	status = acpi_evaluate_object(NULL, (acpi_string)path, &args, &output);
+	if (ACPI_FAILURE(status)) {
+		pr_warn("%s: evaluation failed: %s\n", path, acpi_format_exception(status));
+		return -EIO;
+	}
+
+	obj = output.pointer;
+	if (!obj || obj->type != ACPI_TYPE_BUFFER || obj->buffer.length < 2) {
+		pr_warn("%s: malformed return buffer\n", path);
+		ret = -EIO;
+		goto out;
+	}
+	if (obj->buffer.pointer[0] != 0) {
+		pr_warn("%s: firmware returned STAT=0x%02X\n", path, obj->buffer.pointer[0]);
+		ret = -EIO;
+		goto out;
+	}
+	if (rfan)
+		*rfan = obj->buffer.pointer[1];
+out:
+	ACPI_FREE(obj);
+	return ret;
+}
+
+/* Single extended-EC byte write through the firmware's own WTER, falling
+ * back to a raw mailbox poke when fw_path is off.  WTER takes two integer
+ * args (address, value) and returns 0 on success. */
+static int fw_wter(struct honor_fan *hf, u32 addr, u8 val)
+{
+	union acpi_object args_obj[2];
+	struct acpi_object_list args;
+	struct acpi_buffer output = { ACPI_ALLOCATE_BUFFER, NULL };
+	union acpi_object *obj;
+	acpi_status status;
+	int ret = -EIO;
+
+	if (!fw_path)
+		return ec_ext_write(hf, addr, val);
+
+	args_obj[0].type = ACPI_TYPE_INTEGER;
+	args_obj[0].integer.value = addr;
+	args_obj[1].type = ACPI_TYPE_INTEGER;
+	args_obj[1].integer.value = val;
+	args.count = 2;
+	args.pointer = args_obj;
+
+	status = acpi_evaluate_object(NULL, "\\_SB.PC00.LPCB.H_EC.WTER",
+				      &args, &output);
+	if (ACPI_FAILURE(status)) {
+		pr_warn("WTER evaluation failed: %s\n", acpi_format_exception(status));
+		return -EIO;
+	}
+
+	obj = output.pointer;
+	if (obj && obj->type == ACPI_TYPE_INTEGER && obj->integer.value == 0)
+		ret = 0;
+	else
+		pr_warn("WTER(0x%08X, 0x%02X) returned failure\n", addr, val);
+	ACPI_FREE(obj);
+	return ret;
+}
+
 static int fan_rpm(struct honor_fan *hf, int idx, long *val)
 {
 	u8 lo, hi;
@@ -218,29 +316,38 @@ static int fan_rpm(struct honor_fan *hf, int idx, long *val)
 }
 
 /*
- * One FSUD/FSVL programming pass.  Both registers are always written:
- * a stale FSVL leaves the EC latched with the fans stopped.
+ * One FSUD/FSVL programming pass for manual targets.  Both registers are
+ * always written together; a stale FSVL is what latches the EC with the
+ * fans stopped.  (The manual->auto release path in apply_pwm is exempt: it
+ * zeroes FSVL first, then FSUD, with a settle between the two steps.)
  */
 static int program_fan(struct honor_fan *hf, u8 fsud, u8 fsvl)
 {
-	int ret = ec_ext_write(hf, EXT_FSUD, fsud);
+	int ret;
 
-	if (ret)
-		return ret;
-	ret = ec_ext_write(hf, EXT_FSVL, fsvl);
+	if (fw_path) {
+		/* One interpreter call programs both bytes with the
+		 * firmware's own ECMT locking and Sleep(2ms) pacing. */
+		ret = fw_call("\\SFCS", fsud, fsvl, NULL);
+	} else {
+		ret = ec_ext_write(hf, EXT_FSUD, fsud);
+		if (ret)
+			return ret;
+		ret = ec_ext_write(hf, EXT_FSVL, fsvl);
+	}
 	if (ret)
 		return ret;
 
 	hf->last_fsud = fsud;
 	hf->last_fsvl = fsvl;
 	hf->programmed = true;
+	msleep(write_delay_ms);
 	return 0;
 }
 
 static int apply_pwm(struct honor_fan *hf)
 {
-	u8 fsud = 0, fsvl = 0, target;
-	int ret;
+	u8 fsud = 0, fsvl = 0;
 
 	/*
 	 * FSVL is an increment above the fan's idle base, in units of
@@ -261,31 +368,52 @@ static int apply_pwm(struct honor_fan *hf)
 		return 0;
 
 	/*
-	 * The EC will not accept a new FSVL while FSUD is already 1: the
-	 * write is swallowed and the fans stop.  Every change must go
-	 * through a release, and the release needs time to settle -- the
-	 * inter-write pacing alone is not enough.
+	 * The initial (0,0) is the EC's power-on state; "programming" it
+	 * would only spend mailbox transactions for nothing.
 	 */
-	ret = program_fan(hf, 0, 0);
-	if (ret)
-		return ret;
-
-	if (fsud) {
-		msleep(release_delay_ms);
-		ret = program_fan(hf, fsud, fsvl);
-		if (ret)
-			return ret;
+	if (!hf->programmed && fsud == 0 && fsvl == 0) {
+		hf->last_fsud = 0;
+		hf->last_fsvl = 0;
+		hf->programmed = true;
+		return 0;
 	}
 
-	/* Confirm the EC took it; a zero target means it stopped listening. */
-	if (ec_ext_read(hf, EXT_FAN0_GEAR, &target) || target)
-		return 0;
+	/*
+	 * Program the target directly, in every direction.  In particular
+	 * there is deliberately NO release-before-rearm here: overwriting
+	 * FSUD/FSVL while manual is accepted by the EC, but a (0,0)
+	 * release followed by a quick re-arm wedges it with both fans
+	 * stopped.  Likewise there is no readback confirm -- the tachometer
+	 * reports the result on its own timescale, and extra mailbox
+	 * traffic right after a program only adds desync risk.
+	 */
+	if (fsud != 0 || !hf->programmed || hf->last_fsud == 0)
+		return program_fan(hf, fsud, fsvl);
 
-	pr_warn("EC ignored fan programming; releasing to firmware\n");
-	msleep(200);
-	hf->manual = false;
-	program_fan(hf, 0, 0);
-	return 0;
+	/*
+	 * Leaving manual mode: step down to idle-manual first, settle,
+	 * then hand ownership back, settling again.  A back-to-back (0,0)
+	 * pair across the mode transition wedges the EC with both fans
+	 * stopped; spaced single-byte steps do not.
+	 */
+	if (hf->last_fsvl != 0) {
+		int ret = fw_wter(hf, EXT_FSVL, 0);
+
+		if (ret)
+			return ret;
+		hf->last_fsvl = 0;
+		msleep(release_step_ms);
+	}
+	{
+		int ret = fw_wter(hf, EXT_FSUD, 0);
+
+		if (ret)
+			return ret;
+		hf->last_fsud = 0;
+		hf->programmed = true;
+		msleep(release_step_ms);
+		return 0;
+	}
 }
 
 /* --- hwmon ------------------------------------------------------------- */
@@ -465,9 +593,48 @@ static ssize_t ec_data_store(struct device *dev, struct device_attribute *a,
 static DEVICE_ATTR_RW(ec_addr);
 static DEVICE_ATTR_RW(ec_data);
 
+/* ZNCJ (plain EC 0x79) via \GSFV / \IFCI: readback tells whether the EC
+ * fired _QF8 and took fan ownership back (0xA0 = firmware auto). */
+static ssize_t zncj_show(struct device *dev, struct device_attribute *a, char *buf)
+{
+	struct honor_fan *hf = dev_get_drvdata(dev);
+	u8 v;
+	int ret;
+
+	mutex_lock(&hf->lock);
+	ret = fw_call("\\GSFV", 0, 0, &v);
+	mutex_unlock(&hf->lock);
+
+	return ret ? ret : sysfs_emit(buf, "0x%02X\n", v);
+}
+
+static ssize_t zncj_store(struct device *dev, struct device_attribute *a,
+			  const char *buf, size_t len)
+{
+	struct honor_fan *hf = dev_get_drvdata(dev);
+	u8 v, back;
+	int ret;
+
+	if (kstrtou8(buf, 0, &v))
+		return -EINVAL;
+
+	mutex_lock(&hf->lock);
+	ret = fw_call("\\IFCI", v, 0, &back);
+	mutex_unlock(&hf->lock);
+	if (ret)
+		return ret;
+	if (back != v)
+		pr_warn("IFCI(0x%02X) read back 0x%02X\n", v, back);
+	msleep(write_delay_ms);
+	return len;
+}
+
+static DEVICE_ATTR_RW(zncj);
+
 static struct attribute *honor_fan_attrs[] = {
 	&dev_attr_ec_addr.attr,
 	&dev_attr_ec_data.attr,
+	&dev_attr_zncj.attr,
 	NULL
 };
 ATTRIBUTE_GROUPS(honor_fan);
