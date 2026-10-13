@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Honor Fan
+Comment=Fan monitor and control for HONOR MagicBook Pro 16 (DRA-XX)
+Exec=python3 /home/ailce/项目/honor-fan/tools/honor-fan-gui.py
+Icon=fan
+Terminal=false
+Categories=System;Monitor;
