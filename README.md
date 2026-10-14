@@ -13,7 +13,7 @@ Secure Boot 会让内核进入 `lockdown=integrity` 模式，它封死了所有�
 内核模块不受限制——这正是本驱动存在的原因。
 
 ```bash
-git clone https://github.com/Little-King2022/honor-fan
+git clone https://github.com/littleflit/honor-fan.git
 cd honor-fan/kernel
 make                  # clang 构建的内核（如 CachyOS）：make LLVM=1
 ```
