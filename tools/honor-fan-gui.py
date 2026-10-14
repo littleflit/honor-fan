@@ -14,6 +14,7 @@ import sys
 import time
 
 from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtGui import QIcon
 from PyQt5.QtWidgets import (
     QApplication,
     QGridLayout,
@@ -30,6 +31,8 @@ REFRESH_MS = 2000
 KO_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "kernel", "honor_fan.ko")
+ICON_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "honor-fan.svg")
 
 
 def find_hwmon():
@@ -57,6 +60,8 @@ class Panel(QWidget):
         super().__init__()
         self.hwmon = hwmon
         self.setWindowTitle("Honor Fan")
+        if os.path.isfile(ICON_PATH):
+            self.setWindowIcon(QIcon(ICON_PATH))
         self.setMinimumWidth(380)
 
         layout = QVBoxLayout(self)
@@ -241,6 +246,8 @@ class Panel(QWidget):
 
 def main():
     app = QApplication(sys.argv)
+    if os.path.isfile(ICON_PATH):
+        app.setWindowIcon(QIcon(ICON_PATH))
     hwmon = find_hwmon()
     if hwmon is None:
         QMessageBox.critical(None, "Honor Fan",
