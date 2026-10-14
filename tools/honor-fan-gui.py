@@ -140,8 +140,11 @@ class Panel(QWidget):
         self.ctrl_val.setText("on" if controllable else "off (monitoring only)")
         self.ctrl_btn.setText("Monitoring only" if controllable else "Enable control")
         # pwm writes are refused without enable_control=1; grey them out.
+        # NOTE: auto (pwm1_enable=2) is also a pwm write in the driver,
+        # so it needs control too.
         self.slider.setEnabled(controllable)
         self.set_btn.setEnabled(controllable)
+        self.auto_btn.setEnabled(controllable)
         self.mode_val.setText("manual" if en == 1 else "auto (firmware)")
         if pwm is not None:
             self.mode_val.setText(
@@ -174,7 +177,8 @@ class Panel(QWidget):
             err = (r.stderr or "").strip().splitlines()
             detail = err[-1] if err else f"exit code {r.returncode}"
             self.status.setText(f"{action} failed: {detail}")
-            if "EPERM" in detail or "Permission" in detail:
+            if ("EPERM" in detail or "Permission" in detail
+                    or "权限" in detail or "不允许" in detail):
                 QMessageBox.warning(
                     self, "Not allowed",
                     "The driver refused the write.\n"
@@ -246,6 +250,11 @@ class Panel(QWidget):
 
 def main():
     app = QApplication(sys.argv)
+    app.setApplicationName("honor-fan")
+    try:
+        app.setDesktopFileName("honor-fan-gui")
+    except AttributeError:
+        pass
     if os.path.isfile(ICON_PATH):
         app.setWindowIcon(QIcon(ICON_PATH))
     hwmon = find_hwmon()
