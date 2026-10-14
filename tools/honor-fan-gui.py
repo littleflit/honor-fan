@@ -11,6 +11,7 @@ Requires: python-pyqt5, pkexec, the honor_fan module loaded
 import os
 import subprocess
 import sys
+import time
 
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
@@ -26,6 +27,9 @@ from PyQt5.QtWidgets import (
 )
 
 REFRESH_MS = 2000
+KO_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "kernel", "honor_fan.ko")
 
 
 def find_hwmon():
@@ -53,20 +57,21 @@ class Panel(QWidget):
         super().__init__()
         self.hwmon = hwmon
         self.setWindowTitle("Honor Fan")
-        self.setMinimumWidth(340)
+        self.setMinimumWidth(380)
 
         layout = QVBoxLayout(self)
 
         grid = QGridLayout()
         self.mode_val = QLabel("-")
+        self.ctrl_val = QLabel("-")
         self.fan1_val = QLabel("-")
         self.fan2_val = QLabel("-")
         self.cpu_val = QLabel("-")
         self.hot_val = QLabel("-")
         for row, (name, widget) in enumerate(
-            [("Mode", self.mode_val), ("Fan 1", self.fan1_val),
-             ("Fan 2", self.fan2_val), ("CPU", self.cpu_val),
-             ("Hottest", self.hot_val)]
+            [("Mode", self.mode_val), ("Control", self.ctrl_val),
+             ("Fan 1", self.fan1_val), ("Fan 2", self.fan2_val),
+             ("CPU", self.cpu_val), ("Hottest", self.hot_val)]
         ):
             grid.addWidget(QLabel(name), row, 0)
             grid.addWidget(widget, row, 1)
@@ -94,6 +99,10 @@ class Panel(QWidget):
         row.addWidget(self.auto_btn)
         layout.addLayout(row)
 
+        self.ctrl_btn = QPushButton("Enable control")
+        self.ctrl_btn.clicked.connect(self.toggle_control)
+        layout.addWidget(self.ctrl_btn)
+
         self.status = QLabel("0% = idle (~1600 rpm), never off.")
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
@@ -111,7 +120,23 @@ class Panel(QWidget):
         f2 = read_int(f"{h}/fan2_input")
         if en is None:
             self.status.setText("Driver gone — is honor_fan still loaded?")
+            self.set_btn.setEnabled(False)
+            self.auto_btn.setEnabled(False)
+            self.ctrl_btn.setEnabled(False)
             return
+        self.set_btn.setEnabled(True)
+        self.auto_btn.setEnabled(True)
+        self.ctrl_btn.setEnabled(True)
+        try:
+            with open("/sys/module/honor_fan/parameters/enable_control") as fh:
+                controllable = fh.read().strip() in ("Y", "y", "1")
+        except OSError:
+            controllable = False
+        self.ctrl_val.setText("on" if controllable else "off (monitoring only)")
+        self.ctrl_btn.setText("Monitoring only" if controllable else "Enable control")
+        # pwm writes are refused without enable_control=1; grey them out.
+        self.slider.setEnabled(controllable)
+        self.set_btn.setEnabled(controllable)
         self.mode_val.setText("manual" if en == 1 else "auto (firmware)")
         if pwm is not None:
             self.mode_val.setText(
@@ -167,6 +192,51 @@ class Panel(QWidget):
     def set_auto(self):
         self._priv_write(f"echo 2 > {self.hwmon}/pwm1_enable",
                          "Back to firmware control")
+
+    def toggle_control(self):
+        """Reload the module with/without enable_control=1.
+
+        The parameter is load-time only, so switching means rmmod+insmod
+        (one pkexec prompt). The hwmon index can change across reloads,
+        so re-discover it afterwards.
+        """
+        try:
+            with open("/sys/module/honor_fan/parameters/enable_control") as fh:
+                controllable = fh.read().strip() in ("Y", "y", "1")
+        except OSError:
+            controllable = False
+        if not os.path.isfile(KO_PATH):
+            QMessageBox.critical(self, "Honor Fan",
+                                 f"Module file not found:\n{KO_PATH}\n"
+                                 "Build it first: make LLVM=1 in kernel/.")
+            return
+        if controllable:
+            script = "rmmod honor_fan && insmod " + KO_PATH
+            action = "Monitoring only"
+        else:
+            script = "rmmod honor_fan && insmod " + KO_PATH + " enable_control=1"
+            action = "Control enabled"
+        self.status.setText("Reloading module…")
+        QApplication.processEvents()
+        r = subprocess.run(["pkexec", "sh", "-c", script],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            err = (r.stderr or "").strip().splitlines()
+            self.status.setText(
+                f"Reload failed: {err[-1] if err else r.returncode}")
+            return
+        hwmon = None
+        for _ in range(25):
+            hwmon = find_hwmon()
+            if hwmon is not None:
+                break
+            time.sleep(0.2)
+        if hwmon is None:
+            self.status.setText("Reloaded but hwmon did not reappear?")
+            return
+        self.hwmon = hwmon
+        self.status.setText(f"{action} ok.")
+        self.refresh()
 
 
 def main():
