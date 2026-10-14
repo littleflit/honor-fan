@@ -10,8 +10,9 @@ controller, reachable through an undocumented memory-mapped command mailbox.
 This project reverse-engineers that mailbox out of the machine's own ACPI tables and
 implements it as a small `hwmon` kernel driver.
 
-> **Read this first:** fan *monitoring* is solid. Fan *control* works but is not yet
-> reliable — see [Status](#status). Control is therefore **opt-in**.
+> **Read this first:** fan *monitoring* is solid, and fan *control* works too —
+> repeated speed changes and returning to firmware control are all verified.
+> See [Status](#status) for the caveats. Control is **opt-in**.
 
 [中文文档](README.zh-CN.md)
 
@@ -26,7 +27,7 @@ implements it as a small `hwmon` kernel driver.
 | GPU | NVIDIA RTX 4060 Laptop |
 | EC | `\_SB.PC00.LPCB.H_EC`, Nuvoton |
 | Fans | **2** physical fans |
-| Tested on | Ubuntu 24.04, kernel 7.0 |
+| Tested on | Ubuntu 24.04 (kernel 7.0); CachyOS (kernel 7.2.9-1-cachyos, clang-built) |
 
 Likely applicable to other HONOR MagicBook / Huawei MateBook models that share this EC
 firmware, but the addresses below are only verified on `DRA-XX`. Load with `force=1` to
@@ -134,8 +135,13 @@ this hardware (`/dev/mem`, `ioperm()`, `ec_sys write_support=1`, unsigned module
 ```bash
 git clone https://github.com/Little-King2022/honor-fan
 cd honor-fan/kernel
-make
+make                  # kernels built with clang (e.g. CachyOS): make LLVM=1
 ```
+
+> Kernels built with clang cannot build modules with gcc. If you see
+> `gcc: error: unrecognized command-line option '-mllvm'` and friends,
+> your kernel is clang-built — use `make LLVM=1` (and `make LLVM=1 install`
+> below). The required clang version matches the one in `/proc/version`.
 
 ### With Secure Boot on (recommended)
 
@@ -160,11 +166,18 @@ Nothing to sign — just `sudo insmod honor_fan.ko`.
 ```bash
 sudo insmod honor_fan.ko                    # monitoring only
 sudo insmod honor_fan.ko enable_control=1   # also allow setting speed
-
-# permanently
-sudo make install
-echo honor_fan | sudo tee /etc/modules-load.d/honor_fan.conf
 ```
+
+### Permanently
+
+```bash
+sudo make LLVM=1 install   # plain `make install` on gcc-built kernels
+echo honor_fan | sudo tee /etc/modules-load.d/honor_fan.conf
+echo "options honor_fan enable_control=1" | sudo tee /etc/modprobe.d/honor_fan.conf
+```
+
+Re-run `make install` after each kernel update (rolling distros change the
+kernel often); the module is built against the running kernel's headers.
 
 ## Usage
 
@@ -188,6 +201,22 @@ With `enable_control=1`:
 tools/honor-fan set 70      # manual, 70%
 tools/honor-fan auto        # hand back to EC firmware
 ```
+
+### Graphical control
+
+`tools/honor-fan-gui.py` is a small Qt panel (PyQt5): live RPM/temperatures,
+a 0–100% slider with `Set manual`, an `Auto (firmware)` button, and a
+control/monitoring toggle (reloads the module with or without
+`enable_control=1`).
+
+```bash
+python3 tools/honor-fan-gui.py
+cp tools/honor-fan-gui.desktop ~/.local/share/applications/  # app launcher
+```
+
+It runs unprivileged; only the buttons ask for root via a `pkexec` graphical
+prompt. Pick it **or** the curve daemon below — both write `pwm1` and would
+fight each other.
 
 Temperature-driven curve (`tools/fan_curve.py`) with a systemd unit is included. It
 returns the fans to firmware control on exit, as does the driver on unload.
@@ -231,7 +260,8 @@ regardless of what this driver does.
 ## Reproducing the research
 
 ```bash
-sudo apt install acpica-tools
+sudo apt install acpica-tools        # Debian/Ubuntu
+sudo pacman -S acpica                 # Arch/CachyOS
 sudo cp /sys/firmware/acpi/tables/DSDT dsdt.dat
 iasl -d dsdt.dat
 grep -n "RDER\|WTER\|GFNS\|SFCS" dsdt.dsl

@@ -8,8 +8,8 @@
 
 本项目从这台机器自己的 ACPI 表中逆向出该信箱协议，并实现为一个 `hwmon` 内核驱动。
 
-> **请先看这里**：风扇**读取**功能稳定可靠；风扇**控制**功能可用但尚不稳定，
-> 详见 [当前状态](#当前状态)。因此控制功能默认关闭，需显式开启。
+> **请先看这里**：风扇**读取**稳定可靠，风扇**控制**同样可用——反复改速、
+> 交还固件均已验证，注意事项见 [当前状态](#当前状态)。控制功能默认关闭，需显式开启。
 
 [English](README.md)
 
@@ -24,7 +24,7 @@
 | 显卡 | NVIDIA RTX 4060 Laptop |
 | EC | `\_SB.PC00.LPCB.H_EC`，新唐（Nuvoton） |
 | 风扇 | **2 个**物理风扇 |
-| 测试环境 | Ubuntu 24.04，内核 7.0 |
+| 测试环境 | Ubuntu 24.04（内核 7.0）；CachyOS（内核 7.2.9-1-cachyos，clang 构建） |
 
 共用同代 EC 固件的其他荣耀 MagicBook / 华为 MateBook 机型可能同样适用，但下文的地址
 只在 `DRA-XX` 上验证过。其他机型可用 `force=1` 加载尝试，风险自负。
@@ -124,8 +124,13 @@ Secure Boot 会让内核进入 `lockdown=integrity` 模式，它封死了所有�
 ```bash
 git clone https://github.com/Little-King2022/honor-fan
 cd honor-fan/kernel
-make
+make                  # clang 构建的内核（如 CachyOS）：make LLVM=1
 ```
+
+> clang 构建的内核不能用 gcc 编模块。如果见到
+> `gcc: error: unrecognized command-line option '-mllvm'` 之类报错，
+> 说明你的内核是 clang 编的——改用 `make LLVM=1`（下面的 install 同理）。
+> 所需 clang 版本与 `/proc/version` 里的一致即可。
 
 ### 保持 Secure Boot 开启（推荐）
 
@@ -148,11 +153,18 @@ sudo reboot                   # 蓝色 MOK 界面：Enroll MOK -> Continue -> Ye
 ```bash
 sudo insmod honor_fan.ko                    # 仅监控
 sudo insmod honor_fan.ko enable_control=1   # 同时允许调速
-
-# 开机自动加载
-sudo make install
-echo honor_fan | sudo tee /etc/modules-load.d/honor_fan.conf
 ```
+
+### 持久化
+
+```bash
+sudo make LLVM=1 install   # gcc 构建的内核直接 sudo make install
+echo honor_fan | sudo tee /etc/modules-load.d/honor_fan.conf
+echo "options honor_fan enable_control=1" | sudo tee /etc/modprobe.d/honor_fan.conf
+```
+
+滚动发行版内核更新频繁，每次大更新后回来重新 `make install` 一次
+（模块针对当前运行内核的头文件构建）。
 
 ## 使用
 
@@ -176,6 +188,20 @@ SEN1      : 40 C
 tools/honor-fan set 70      # 手动，70%
 tools/honor-fan auto        # 交还 EC 固件
 ```
+
+### 图形界面
+
+`tools/honor-fan-gui.py` 是个小 Qt 面板（PyQt5）：实时转速/温度、0–100% 滑杆 +
+`Set manual`、切回固件的 `Auto` 按钮，以及控制/仅监控一键切换
+（后台重载模块以增减 `enable_control=1`）。
+
+```bash
+python3 tools/honor-fan-gui.py
+cp tools/honor-fan-gui.desktop ~/.local/share/applications/  # 进启动器
+```
+
+程序本身无特权运行，只有按钮操作经 `pkexec` 弹框提权。和下面的曲线守护进程
+**二选一**——两者都会写 `pwm1`，同时跑会打架。
 
 项目还包含温度曲线守护进程（`tools/fan_curve.py`）及其 systemd 服务单元。它在退出时会
 把风扇交还固件控制，驱动卸载时同样如此。
@@ -216,7 +242,8 @@ sudo shutdown -h now
 ## 复现这项逆向工作
 
 ```bash
-sudo apt install acpica-tools
+sudo apt install acpica-tools        # Debian/Ubuntu
+sudo pacman -S acpica                 # Arch/CachyOS
 sudo cp /sys/firmware/acpi/tables/DSDT dsdt.dat
 iasl -d dsdt.dat
 grep -n "RDER\|WTER\|GFNS\|SFCS" dsdt.dsl
