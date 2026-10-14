@@ -36,6 +36,10 @@ status)
     for f in "$H"/fan*_input; do
         printf "%-10s: %s rpm\n" "$(basename "$f" _input)" "$(cat "$f")"
     done
+    if [ "$(cat "$H"/device/wedge 2>/dev/null)" = 1 ]; then
+        echo "!! EC wedged: fans stopped. Recovery: sudo rmmod honor_fan; sleep 300;"
+        echo "   sudo insmod honor_fan.ko -- or a G3 power cycle (see README)."
+    fi
     echo
     for t in "$H"/temp*_input; do
         n=$(basename "$t" _input)

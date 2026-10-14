@@ -94,6 +94,16 @@ module_param(release_step_ms, int, 0644);
 MODULE_PARM_DESC(release_step_ms,
 	"Settle time between the steps of a staged manual->auto release, ms (default 8000)");
 
+static unsigned int wedge_reads = 3;
+module_param(wedge_reads, uint, 0644);
+MODULE_PARM_DESC(wedge_reads,
+	"Consecutive 0-rpm tachometer samples per fan before the EC is declared wedged (default 3). Wedge state is also reported at /sys/.../device/wedge.");
+
+static unsigned int wedge_recover_reads = 3;
+module_param(wedge_recover_reads, uint, 0644);
+MODULE_PARM_DESC(wedge_recover_reads,
+	"Consecutive non-zero samples needed to clear wedge state (default 3)");
+
 struct honor_fan {
 	struct device *hwmon;
 	void __iomem *mb;
@@ -103,6 +113,11 @@ struct honor_fan {
 	bool manual;
 	u8 last_fsud, last_fsvl;	/* what the EC was last told */
 	bool programmed;
+	/* EC wedge detection: a stopped fan always reads 0 rpm, and idle is
+	 * never 0 (FSVL 0 => ~1600 rpm), so 0 rpm means the EC is stuck. */
+	unsigned int zero_run[2];
+	unsigned int live_run[2];
+	bool wedge;
 };
 
 static struct platform_device *honor_fan_pdev;
@@ -312,6 +327,33 @@ static int fan_rpm(struct honor_fan *hf, int idx, long *val)
 		return ret;
 
 	*val = lo | (hi << 8);
+
+	/*
+	 * Wedge detection.  The fans never legitimately report 0 rpm: even
+	 * at the lowest manual setting they idle around 1600 rpm, so a 0
+	 * reading means the EC has stopped the fans and stopped answering
+	 * coherently.  Only latch on a run of samples so a single bad
+	 * transaction is not fatal, and require a matching run of live
+	 * samples before declaring recovery.
+	 */
+	if (*val == 0) {
+		hf->zero_run[idx]++;
+		hf->live_run[idx] = 0;
+		if (hf->zero_run[idx] >= wedge_reads && !hf->wedge) {
+			hf->wedge = true;
+			pr_warn("EC appears wedged: fan%d reads 0 rpm for %u consecutive samples (fans stopped); recovery: rmmod, leave idle minutes, else G3 power cycle\n",
+				idx + 1, hf->zero_run[idx]);
+		}
+	} else {
+		hf->live_run[idx]++;
+		if (hf->live_run[idx] >= wedge_recover_reads) {
+			hf->zero_run[idx] = 0;
+			if (hf->wedge)
+				pr_info("EC responding again (fan%d at %ld rpm)\n",
+					idx + 1, *val);
+			hf->wedge = false;
+		}
+	}
 	return 0;
 }
 
@@ -631,10 +673,26 @@ static ssize_t zncj_store(struct device *dev, struct device_attribute *a,
 
 static DEVICE_ATTR_RW(zncj);
 
+/* EC wedge state, for userspace to display: 0 = healthy, 1 = fans stopped.
+ * Polling this costs no mailbox traffic, unlike reading fan*_input. */
+static ssize_t wedge_show(struct device *dev, struct device_attribute *a, char *buf)
+{
+	struct honor_fan *hf = dev_get_drvdata(dev);
+	bool wedged;
+
+	mutex_lock(&hf->lock);
+	wedged = hf->wedge;
+	mutex_unlock(&hf->lock);
+
+	return sysfs_emit(buf, "%u\n", wedged ? 1 : 0);
+}
+static DEVICE_ATTR_RO(wedge);
+
 static struct attribute *honor_fan_attrs[] = {
 	&dev_attr_ec_addr.attr,
 	&dev_attr_ec_data.attr,
 	&dev_attr_zncj.attr,
+	&dev_attr_wedge.attr,
 	NULL
 };
 ATTRIBUTE_GROUPS(honor_fan);

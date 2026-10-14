@@ -112,6 +112,17 @@ class Panel(QWidget):
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
 
+        self.warn = QLabel(
+            "EC wedged: fans stopped (0 rpm).\n"
+            "Close this window, then: sudo rmmod honor_fan; sleep 300;\n"
+            "sudo insmod honor_fan.ko\n"
+            "Still 0 rpm after 15 min: G3 power cycle (shutdown, "
+            "unplug AC, hold power 15 s).")
+        self.warn.setWordWrap(True)
+        self.warn.setStyleSheet("color: #c0392b; font-weight: bold;")
+        self.warn.setVisible(False)
+        layout.addWidget(self.warn)
+
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
         self.timer.start(REFRESH_MS)
@@ -168,6 +179,11 @@ class Panel(QWidget):
             hot = t // 1000 if hot is None else max(hot, t // 1000)
         self.cpu_val.setText(f"{cpu} °C" if cpu is not None else "?")
         self.hot_val.setText(f"{hot} °C" if hot is not None else "?")
+
+        # EC wedge: 0 rpm on both fans means the EC stopped them.  Reads
+        # device/wedge, which costs no mailbox traffic.
+        wedged = read_int(f"{h}/device/wedge") == 1
+        self.warn.setVisible(wedged)
 
     def _priv_write(self, script, action):
         """Run a root shell snippet via pkexec. One auth prompt per action."""
